@@ -94,8 +94,6 @@ class StepScanWorker:
             gm.stop(self._ser)
             gm.set_motor_type(self._ser)
             gm.set_velocity(self._ser, self._motor_rpm)
-            gm.write_software_abs(current_abs)
-            self.queue.put(("status", "Motor ready"))
         except Exception as exc:
             self.queue.put(("error", f"Motor init failed: {exc}"))
             self._cleanup()
@@ -105,7 +103,6 @@ class StepScanWorker:
             self._hat = mcc128(self._address)
             self._hat.a_in_mode_write(self._mode)
             self._hat.a_in_range_write(self._range)
-            self.queue.put(("status", "DAQ ready"))
         except HatError as exc:
             self.queue.put(("error", f"DAQ init failed: {exc}"))
             self._cleanup()
@@ -116,7 +113,6 @@ class StepScanWorker:
                 if not self._run_flag.is_set():
                     break
 
-                self.queue.put(("status", f"Moving to {target} pulses"))
                 current_abs = gm.destination(self._ser, current_abs, int(target))
                 gm.write_software_abs(current_abs)
 
@@ -144,7 +140,6 @@ class StepScanWorker:
                     self.queue.put(("data", current_abs, value))
 
             self.queue.put(("finished", None))
-            self.queue.put(("status", "Worker idle"))
         finally:
             self._cleanup()
 
@@ -288,35 +283,23 @@ class MainWindow(QtWidgets.QMainWindow):
         row2.addWidget(self.spnWin)
         row2.addSpacing(6)
         self.chkAutorng = QtWidgets.QCheckBox("Auto-range")
-        row2.addWidget(self.chkAutorng)
-        row2.addStretch(1)
+        controls.addWidget(self.chkAutorng)
 
-        # Row 3: Motor controls
-        row3 = QtWidgets.QHBoxLayout(); controls.addLayout(row3)
-        row3.addWidget(QtWidgets.QLabel("Start abs:"))
-        self.spnStartAbs = QtWidgets.QSpinBox(); self.spnStartAbs.setRange(-500000, 500000); self.spnStartAbs.setValue(0)
-        row3.addWidget(self.spnStartAbs)
-        row3.addSpacing(6)
-        row3.addWidget(QtWidgets.QLabel("Step pulses:"))
-        self.spnStep = QtWidgets.QSpinBox(); self.spnStep.setRange(-20000, 20000); self.spnStep.setValue(500)
-        row3.addWidget(self.spnStep)
-        row3.addSpacing(6)
-        row3.addWidget(QtWidgets.QLabel("Steps:"))
-        self.spnSteps = QtWidgets.QSpinBox(); self.spnSteps.setRange(1, 5000); self.spnSteps.setValue(50)
-        row3.addWidget(self.spnSteps)
-        row3.addSpacing(6)
-        row3.addWidget(QtWidgets.QLabel("Settle (s):"))
-        self.spnSettle = QtWidgets.QDoubleSpinBox(); self.spnSettle.setRange(0.0, 5.0); self.spnSettle.setDecimals(2); self.spnSettle.setSingleStep(0.05); self.spnSettle.setValue(0.25)
-        row3.addWidget(self.spnSettle)
-        row3.addSpacing(6)
-        row3.addWidget(QtWidgets.QLabel("Avg samples:"))
-        self.spnSamples = QtWidgets.QSpinBox(); self.spnSamples.setRange(1, 32); self.spnSamples.setValue(1)
-        row3.addWidget(self.spnSamples)
-        row3.addSpacing(6)
-        row3.addWidget(QtWidgets.QLabel("Motor RPM:"))
-        self.spnMotorRPM = QtWidgets.QDoubleSpinBox(); self.spnMotorRPM.setRange(0.1, 30.0); self.spnMotorRPM.setDecimals(1); self.spnMotorRPM.setValue(6.0)
-        row3.addWidget(self.spnMotorRPM)
-        row3.addStretch(1)
+        controls.addWidget(QtWidgets.QLabel("Start abs:"))
+        self.spnStartAbs = QtWidgets.QSpinBox(); self.spnStartAbs.setRange(-500000, 500000); self.spnStartAbs.setValue(0); controls.addWidget(self.spnStartAbs)
+        controls.addWidget(QtWidgets.QLabel("Step pulses:"))
+        self.spnStep = QtWidgets.QSpinBox(); self.spnStep.setRange(-20000, 20000); self.spnStep.setValue(500); controls.addWidget(self.spnStep)
+        controls.addWidget(QtWidgets.QLabel("Steps:"))
+        self.spnSteps = QtWidgets.QSpinBox(); self.spnSteps.setRange(1, 5000); self.spnSteps.setValue(50); controls.addWidget(self.spnSteps)
+        controls.addWidget(QtWidgets.QLabel("Settle (s):"))
+        self.spnSettle = QtWidgets.QDoubleSpinBox(); self.spnSettle.setRange(0.0, 5.0); self.spnSettle.setDecimals(2); self.spnSettle.setSingleStep(0.05); self.spnSettle.setValue(0.25); controls.addWidget(self.spnSettle)
+        controls.addWidget(QtWidgets.QLabel("Avg samples:"))
+        self.spnSamples = QtWidgets.QSpinBox(); self.spnSamples.setRange(1, 32); self.spnSamples.setValue(1); controls.addWidget(self.spnSamples)
+        controls.addWidget(QtWidgets.QLabel("Motor RPM:"))
+        self.spnMotorRPM = QtWidgets.QDoubleSpinBox(); self.spnMotorRPM.setRange(0.1, 30.0); self.spnMotorRPM.setDecimals(1); self.spnMotorRPM.setValue(6.0); controls.addWidget(self.spnMotorRPM)
+
+        controls.addStretch(1)
+        self.lblStatus = QtWidgets.QLabel("Status: idle"); controls.addWidget(self.lblStatus)
 
         # Tabs for Live and FFT
         self.tabs = QtWidgets.QTabWidget(); vbox.addWidget(self.tabs, 1)
@@ -600,10 +583,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._complete_scan(worker_ref)
         elif kind == "finished":
             self._complete_scan(worker_ref)
-        elif kind == "status":
-            msg = item[1] if len(item) > 1 else ""
-            if msg:
-                self.lblStatus.setText(f"Status: {msg}")
 
     def _complete_scan(self, worker_ref):
         if worker_ref is not None:
