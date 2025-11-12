@@ -218,43 +218,70 @@ class MainWindow(QtWidgets.QMainWindow):
         pal.setColor(QtGui.QPalette.Highlight, QtGui.QColor("#003366"))
         pal.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("white"))
         self.setPalette(pal)
+        self.setStyleSheet(
+            "QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {"
+            "color: black;"
+            "background-color: #f0f0f0;"
+            "selection-color: white;"
+            "selection-background-color: #3874f2;"
+            "border-radius: 4px;"
+            "padding: 2px;"
+            "}"
+            "QComboBox QAbstractItemView {color: black; background-color: white;}"
+        )
 
     # ---------- UI ----------
     def _build_ui(self):
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         vbox = QtWidgets.QVBoxLayout(central)
 
-        # Top controls / toolbar row
-        controls = QtWidgets.QHBoxLayout(); vbox.addLayout(controls)
+        controls = QtWidgets.QVBoxLayout(); vbox.addLayout(controls)
 
+        # Row 1: command buttons + status
+        row1 = QtWidgets.QHBoxLayout(); controls.addLayout(row1)
         self.btnDetect = QtWidgets.QPushButton("Detect MCC128")
         self.btnStart  = QtWidgets.QPushButton("Start")
         self.btnStop   = QtWidgets.QPushButton("Stop"); self.btnStop.setEnabled(False)
         self.btnPause  = QtWidgets.QPushButton("Pause Display"); self.btnPause.setCheckable(True)
         self.btnSave   = QtWidgets.QPushButton("Save CSV…")
 
-        # Styled buttons
         self.btnStart.setStyleSheet("QPushButton{background-color:#006400;color:white;border-radius:4px;padding:6px;} QPushButton:disabled{background-color:#2a2a2a;color:#777;}")
         self.btnStop.setStyleSheet("QPushButton{background-color:#8B0000;color:white;border-radius:4px;padding:6px;} QPushButton:disabled{background-color:#2a2a2a;color:#777;}")
 
-        controls.addWidget(self.btnDetect)
-        controls.addWidget(self.btnStart)
-        controls.addWidget(self.btnStop)
-        controls.addWidget(self.btnPause)
-        controls.addWidget(self.btnSave)
-        controls.addSpacing(12)
+        for btn in (self.btnDetect, self.btnStart, self.btnStop, self.btnPause, self.btnSave):
+            btn.setMinimumWidth(110)
 
-        # Settings cluster
-        controls.addWidget(QtWidgets.QLabel("Mode:"))
-        self.cmbMode = QtWidgets.QComboBox(); self.cmbMode.addItems(["SE","DIFF"]) ; controls.addWidget(self.cmbMode)
-        controls.addWidget(QtWidgets.QLabel("Range:"))
-        self.cmbRange = QtWidgets.QComboBox(); self.cmbRange.addItems(["±10V","±5V","±2V","±1V"]) ; controls.addWidget(self.cmbRange)
-        controls.addWidget(QtWidgets.QLabel("Channel:"))
-        self.spnChan = QtWidgets.QSpinBox(); self.spnChan.setRange(0,7); self.spnChan.setValue(0); controls.addWidget(self.spnChan)
-        controls.addWidget(QtWidgets.QLabel("Rate (Hz):"))
-        self.spnRate = QtWidgets.QDoubleSpinBox(); self.spnRate.setRange(1, 5000); self.spnRate.setDecimals(0); self.spnRate.setValue(self.sample_hz); controls.addWidget(self.spnRate)
-        controls.addWidget(QtWidgets.QLabel("Window (s):"))
-        self.spnWin = QtWidgets.QDoubleSpinBox(); self.spnWin.setRange(1, 60); self.spnWin.setDecimals(0); self.spnWin.setValue(self.window_s); controls.addWidget(self.spnWin)
+        row1.addWidget(self.btnDetect)
+        row1.addWidget(self.btnStart)
+        row1.addWidget(self.btnStop)
+        row1.addWidget(self.btnPause)
+        row1.addWidget(self.btnSave)
+        row1.addStretch(1)
+        self.lblStatus = QtWidgets.QLabel("Status: idle")
+        row1.addWidget(self.lblStatus, alignment=Qt.AlignRight)
+
+        # Row 2: ADC controls
+        row2 = QtWidgets.QHBoxLayout(); controls.addLayout(row2)
+        row2.addWidget(QtWidgets.QLabel("ADC Mode:"))
+        self.cmbMode = QtWidgets.QComboBox(); self.cmbMode.addItems(["SE", "DIFF"])
+        row2.addWidget(self.cmbMode)
+        row2.addSpacing(6)
+        row2.addWidget(QtWidgets.QLabel("Range:"))
+        self.cmbRange = QtWidgets.QComboBox(); self.cmbRange.addItems(["±10V", "±5V", "±2V", "±1V"])
+        row2.addWidget(self.cmbRange)
+        row2.addSpacing(6)
+        row2.addWidget(QtWidgets.QLabel("Channel:"))
+        self.spnChan = QtWidgets.QSpinBox(); self.spnChan.setRange(0, 7); self.spnChan.setValue(0)
+        row2.addWidget(self.spnChan)
+        row2.addSpacing(6)
+        row2.addWidget(QtWidgets.QLabel("Rate (Hz):"))
+        self.spnRate = QtWidgets.QDoubleSpinBox(); self.spnRate.setRange(1, 5000); self.spnRate.setDecimals(0); self.spnRate.setValue(self.sample_hz)
+        row2.addWidget(self.spnRate)
+        row2.addSpacing(6)
+        row2.addWidget(QtWidgets.QLabel("Window (s):"))
+        self.spnWin = QtWidgets.QDoubleSpinBox(); self.spnWin.setRange(1, 60); self.spnWin.setDecimals(0); self.spnWin.setValue(self.window_s)
+        row2.addWidget(self.spnWin)
+        row2.addSpacing(6)
         self.chkAutorng = QtWidgets.QCheckBox("Auto-range")
         controls.addWidget(self.chkAutorng)
 
