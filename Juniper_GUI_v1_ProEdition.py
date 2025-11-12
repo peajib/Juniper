@@ -20,7 +20,7 @@ If using virtualenv (keep daqhats via apt):
 import sys
 import time
 import threading
-from collections import deque
+import queue
 from pathlib import Path
 
 import numpy as np
@@ -37,80 +37,131 @@ from daqhats import (
     AnalogInputMode, AnalogInputRange, OptionFlags
 )
 
+import GratingMotor4 as gm
+
 # ---------------- Acquisition worker ----------------
 class ADCWorker(QtCore.QObject):
-    sampleReady = QtCore.pyqtSignal(float, float)  # (t_rel_s, volts)
+    """Legacy streaming worker retained for backwards compatibility."""
+    sampleReady = QtCore.pyqtSignal(float, float)
     error = QtCore.pyqtSignal(str)
     stopped = QtCore.pyqtSignal()
 
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+
+class StepScanWorker:
+    """Perform a step-scan: move the grating and acquire MCC128 samples."""
+
     def __init__(self, address: int, channel: int, mode: AnalogInputMode,
-                 rng: AnalogInputRange, sample_hz: float, parent=None):
-        super().__init__(parent)
+                 rng: AnalogInputRange, positions, settle_s: float = 0.25,
+                 samples_per_step: int = 1, motor_rpm: float = 6.0):
         self._address = address
         self._channel = channel
         self._mode = mode
         self._range = rng
-        self._sample_hz = max(1.0, float(sample_hz))
-        self._running = False
-        self._lock = threading.Lock()
-        self._hat = None
+        self._positions = list(positions)
+        self._settle_s = max(0.0, float(settle_s))
+        self._samples_per_step = max(1, int(samples_per_step))
+        self._motor_rpm = float(motor_rpm)
 
-    @QtCore.pyqtSlot()
+        self.queue = queue.Queue()
+        self._ser = None
+        self._hat = None
+        self._thread = None
+        self._run_flag = threading.Event()
+
     def start(self):
-        if self._running:
+        if self._thread and self._thread.is_alive():
             return
-        self._running = True
+        self._run_flag.set()
+        self._thread = threading.Thread(target=self._run, name="StepScanWorker", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._run_flag.clear()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _run(self):
+        current_abs = gm.read_software_abs()
+        try:
+            self._ser = gm.open_port()
+            gm.stop(self._ser)
+            gm.set_motor_type(self._ser)
+            gm.set_velocity(self._ser, self._motor_rpm)
+            gm.write_software_abs(current_abs)
+            self.queue.put(("status", "Motor ready"))
+        except Exception as exc:
+            self.queue.put(("error", f"Motor init failed: {exc}"))
+            self._cleanup()
+            return
+
         try:
             self._hat = mcc128(self._address)
             self._hat.a_in_mode_write(self._mode)
             self._hat.a_in_range_write(self._range)
-        except HatError as e:
-            self.error.emit(f"DAQ init error: {e}")
-            self._running = False
-            self.stopped.emit()
+            self.queue.put(("status", "DAQ ready"))
+        except HatError as exc:
+            self.queue.put(("error", f"DAQ init failed: {exc}"))
+            self._cleanup()
             return
 
-        dt = 1.0 / self._sample_hz
-        t0 = time.perf_counter()
-        next_t = t0
-
         try:
-            while self._running:
-                now = time.perf_counter()
-                if now < next_t:
-                    time.sleep(next_t - now)
-                next_t += dt
-                try:
-                    v = self._hat.a_in_read(self._channel, OptionFlags.DEFAULT)
-                except HatError as e:
-                    self.error.emit(f"Read error: {e}")
-                    v = float('nan')
-                self.sampleReady.emit(time.perf_counter() - t0, float(v))
+            for idx, target in enumerate(self._positions):
+                if not self._run_flag.is_set():
+                    break
+
+                self.queue.put(("status", f"Moving to {target} pulses"))
+                current_abs = gm.destination(self._ser, current_abs, int(target))
+                gm.write_software_abs(current_abs)
+
+                if self._settle_s:
+                    time.sleep(self._settle_s)
+
+                total = 0.0
+                count = 0
+                reading = float("nan")
+                for _ in range(self._samples_per_step):
+                    if not self._run_flag.is_set():
+                        break
+                    try:
+                        reading = float(self._hat.a_in_read(self._channel, OptionFlags.DEFAULT))
+                    except HatError as exc:
+                        self.queue.put(("error", f"Read failed at step {idx}: {exc}"))
+                        reading = float("nan")
+                    total += reading
+                    count += 1
+                    if self._samples_per_step > 1:
+                        time.sleep(0.01)
+
+                if count:
+                    value = total / count
+                    self.queue.put(("data", current_abs, value))
+
+            self.queue.put(("finished", None))
+            self.queue.put(("status", "Worker idle"))
         finally:
-            self.stopped.emit()
+            self._cleanup()
 
-    @QtCore.pyqtSlot()
-    def stop(self):
-        self._running = False
-
-    # Live setters
-    def set_channel(self, ch: int):
-        with self._lock:
-            self._channel = int(ch)
-
-    def set_rate(self, hz: float):
-        with self._lock:
-            self._sample_hz = max(1.0, float(hz))
-
-    def reconfigure(self, mode: AnalogInputMode, rng: AnalogInputRange):
+    def _cleanup(self):
         try:
-            if self._hat is not None:
-                self._hat.a_in_mode_write(mode)
-                self._hat.a_in_range_write(rng)
-            self._mode = mode
-            self._range = rng
-        except Exception:
-            pass
+            if self._ser is not None:
+                try:
+                    gm.stop(self._ser)
+                except Exception:
+                    pass
+                self._ser.close()
+        finally:
+            self._ser = None
+
+        if self._hat is not None:
+            self._hat = None
+
 
 # ---------------- Matplotlib helpers ----------------
 def style_axes_pro(ax, window_s):
@@ -121,9 +172,9 @@ def style_axes_pro(ax, window_s):
         spine.set_color("white")
     ax.tick_params(colors="white")
     ax.grid(True, color='white', alpha=0.15, linestyle='--', linewidth=0.7)
-    ax.set_xlabel("Time (s)", color="white")
-    ax.set_ylabel("Voltage (V)", color="white")
-    ax.set_xlim(-window_s, 0.0)
+    ax.set_xlabel("Grating position (pulses)", color="white")
+    ax.set_ylabel("Signal (V)", color="white")
+    ax.set_xlim(0.0, max(1.0, float(window_s)))
 
 # ---------------- Main window ----------------
 class MainWindow(QtWidgets.QMainWindow):
@@ -135,12 +186,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Runtime holders
         self.address = None
         self.worker = None
-        self.thread = None
 
-        # Buffers
+        # Spectrum buffers
         self.window_s = 10.0
         self.sample_hz = 500.0
-        self._alloc_buffers()
+        self.spectrum_positions = []
+        self.spectrum_values = []
+        self._plot_dirty = False
 
         self.display_paused = False
 
@@ -150,14 +202,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect()
         self.find_device()
 
-        # UI refresh timers
-        self.timer_plot = QtCore.QTimer(self)
-        self.timer_plot.setInterval(50)  # ~20 FPS
-        self.timer_plot.timeout.connect(self._update_plot)
-
-        self.timer_fft = QtCore.QTimer(self)
-        self.timer_fft.setInterval(1000) # 1 Hz FFT updates
-        self.timer_fft.timeout.connect(self._update_fft)
+        # Worker polling
+        self.queue_timer = QtCore.QTimer(self)
+        self.queue_timer.setInterval(50)
+        self.queue_timer.timeout.connect(self._poll_worker_queue)
 
     # ---------- Theme ----------
     def _apply_dark_palette(self):
@@ -175,48 +223,100 @@ class MainWindow(QtWidgets.QMainWindow):
         pal.setColor(QtGui.QPalette.Highlight, QtGui.QColor("#003366"))
         pal.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("white"))
         self.setPalette(pal)
+        self.setStyleSheet(
+            "QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {"
+            "color: black;"
+            "background-color: #f0f0f0;"
+            "selection-color: white;"
+            "selection-background-color: #3874f2;"
+            "border-radius: 4px;"
+            "padding: 2px;"
+            "}"
+            "QComboBox QAbstractItemView {color: black; background-color: white;}"
+        )
 
     # ---------- UI ----------
     def _build_ui(self):
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         vbox = QtWidgets.QVBoxLayout(central)
 
-        # Top controls / toolbar row
-        controls = QtWidgets.QHBoxLayout(); vbox.addLayout(controls)
+        controls = QtWidgets.QVBoxLayout(); vbox.addLayout(controls)
 
+        # Row 1: command buttons + status
+        row1 = QtWidgets.QHBoxLayout(); controls.addLayout(row1)
         self.btnDetect = QtWidgets.QPushButton("Detect MCC128")
         self.btnStart  = QtWidgets.QPushButton("Start")
         self.btnStop   = QtWidgets.QPushButton("Stop"); self.btnStop.setEnabled(False)
         self.btnPause  = QtWidgets.QPushButton("Pause Display"); self.btnPause.setCheckable(True)
         self.btnSave   = QtWidgets.QPushButton("Save CSV…")
 
-        # Styled buttons
         self.btnStart.setStyleSheet("QPushButton{background-color:#006400;color:white;border-radius:4px;padding:6px;} QPushButton:disabled{background-color:#2a2a2a;color:#777;}")
         self.btnStop.setStyleSheet("QPushButton{background-color:#8B0000;color:white;border-radius:4px;padding:6px;} QPushButton:disabled{background-color:#2a2a2a;color:#777;}")
 
-        controls.addWidget(self.btnDetect)
-        controls.addWidget(self.btnStart)
-        controls.addWidget(self.btnStop)
-        controls.addWidget(self.btnPause)
-        controls.addWidget(self.btnSave)
-        controls.addSpacing(12)
+        for btn in (self.btnDetect, self.btnStart, self.btnStop, self.btnPause, self.btnSave):
+            btn.setMinimumWidth(110)
 
-        # Settings cluster
-        controls.addWidget(QtWidgets.QLabel("Mode:"))
-        self.cmbMode = QtWidgets.QComboBox(); self.cmbMode.addItems(["SE","DIFF"]) ; controls.addWidget(self.cmbMode)
-        controls.addWidget(QtWidgets.QLabel("Range:"))
-        self.cmbRange = QtWidgets.QComboBox(); self.cmbRange.addItems(["±10V","±5V","±2V","±1V"]) ; controls.addWidget(self.cmbRange)
-        controls.addWidget(QtWidgets.QLabel("Channel:"))
-        self.spnChan = QtWidgets.QSpinBox(); self.spnChan.setRange(0,7); self.spnChan.setValue(0); controls.addWidget(self.spnChan)
-        controls.addWidget(QtWidgets.QLabel("Rate (Hz):"))
-        self.spnRate = QtWidgets.QDoubleSpinBox(); self.spnRate.setRange(1, 5000); self.spnRate.setDecimals(0); self.spnRate.setValue(self.sample_hz); controls.addWidget(self.spnRate)
-        controls.addWidget(QtWidgets.QLabel("Window (s):"))
-        self.spnWin = QtWidgets.QDoubleSpinBox(); self.spnWin.setRange(1, 60); self.spnWin.setDecimals(0); self.spnWin.setValue(self.window_s); controls.addWidget(self.spnWin)
+        row1.addWidget(self.btnDetect)
+        row1.addWidget(self.btnStart)
+        row1.addWidget(self.btnStop)
+        row1.addWidget(self.btnPause)
+        row1.addWidget(self.btnSave)
+        row1.addStretch(1)
+        self.lblStatus = QtWidgets.QLabel("Status: idle")
+        row1.addWidget(self.lblStatus, alignment=Qt.AlignRight)
+
+        # Row 2: ADC controls
+        row2 = QtWidgets.QHBoxLayout(); controls.addLayout(row2)
+        row2.addWidget(QtWidgets.QLabel("ADC Mode:"))
+        self.cmbMode = QtWidgets.QComboBox(); self.cmbMode.addItems(["SE", "DIFF"])
+        row2.addWidget(self.cmbMode)
+        row2.addSpacing(6)
+        row2.addWidget(QtWidgets.QLabel("Range:"))
+        self.cmbRange = QtWidgets.QComboBox(); self.cmbRange.addItems(["±10V", "±5V", "±2V", "±1V"])
+        row2.addWidget(self.cmbRange)
+        row2.addSpacing(6)
+        row2.addWidget(QtWidgets.QLabel("Channel:"))
+        self.spnChan = QtWidgets.QSpinBox(); self.spnChan.setRange(0, 7); self.spnChan.setValue(0)
+        row2.addWidget(self.spnChan)
+        row2.addSpacing(6)
+        row2.addWidget(QtWidgets.QLabel("Rate (Hz):"))
+        self.spnRate = QtWidgets.QDoubleSpinBox(); self.spnRate.setRange(1, 5000); self.spnRate.setDecimals(0); self.spnRate.setValue(self.sample_hz)
+        row2.addWidget(self.spnRate)
+        row2.addSpacing(6)
+        row2.addWidget(QtWidgets.QLabel("Window (s):"))
+        self.spnWin = QtWidgets.QDoubleSpinBox(); self.spnWin.setRange(1, 60); self.spnWin.setDecimals(0); self.spnWin.setValue(self.window_s)
+        row2.addWidget(self.spnWin)
+        row2.addSpacing(6)
         self.chkAutorng = QtWidgets.QCheckBox("Auto-range")
-        controls.addWidget(self.chkAutorng)
+        row2.addWidget(self.chkAutorng)
+        row2.addStretch(1)
 
-        controls.addStretch(1)
-        self.lblStatus = QtWidgets.QLabel("Status: idle"); controls.addWidget(self.lblStatus)
+        # Row 3: Motor controls
+        row3 = QtWidgets.QHBoxLayout(); controls.addLayout(row3)
+        row3.addWidget(QtWidgets.QLabel("Start abs:"))
+        self.spnStartAbs = QtWidgets.QSpinBox(); self.spnStartAbs.setRange(-500000, 500000); self.spnStartAbs.setValue(0)
+        row3.addWidget(self.spnStartAbs)
+        row3.addSpacing(6)
+        row3.addWidget(QtWidgets.QLabel("Step pulses:"))
+        self.spnStep = QtWidgets.QSpinBox(); self.spnStep.setRange(-20000, 20000); self.spnStep.setValue(500)
+        row3.addWidget(self.spnStep)
+        row3.addSpacing(6)
+        row3.addWidget(QtWidgets.QLabel("Steps:"))
+        self.spnSteps = QtWidgets.QSpinBox(); self.spnSteps.setRange(1, 5000); self.spnSteps.setValue(50)
+        row3.addWidget(self.spnSteps)
+        row3.addSpacing(6)
+        row3.addWidget(QtWidgets.QLabel("Settle (s):"))
+        self.spnSettle = QtWidgets.QDoubleSpinBox(); self.spnSettle.setRange(0.0, 5.0); self.spnSettle.setDecimals(2); self.spnSettle.setSingleStep(0.05); self.spnSettle.setValue(0.25)
+        row3.addWidget(self.spnSettle)
+        row3.addSpacing(6)
+        row3.addWidget(QtWidgets.QLabel("Avg samples:"))
+        self.spnSamples = QtWidgets.QSpinBox(); self.spnSamples.setRange(1, 32); self.spnSamples.setValue(1)
+        row3.addWidget(self.spnSamples)
+        row3.addSpacing(6)
+        row3.addWidget(QtWidgets.QLabel("Motor RPM:"))
+        self.spnMotorRPM = QtWidgets.QDoubleSpinBox(); self.spnMotorRPM.setRange(0.1, 30.0); self.spnMotorRPM.setDecimals(1); self.spnMotorRPM.setValue(6.0)
+        row3.addWidget(self.spnMotorRPM)
+        row3.addStretch(1)
 
         # Tabs for Live and FFT
         self.tabs = QtWidgets.QTabWidget(); vbox.addWidget(self.tabs, 1)
@@ -268,21 +368,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spnChan.valueChanged.connect(self._apply_channel)
 
     # ---------- Helpers ----------
-    def _alloc_buffers(self):
-        N = max(2, int(self.window_s * self.sample_hz))
-        self.tbuf = deque([0.0]*N, maxlen=N)
-        self.vbuf = deque([0.0]*N, maxlen=N)
+    def _reset_spectrum(self):
+        self.spectrum_positions = []
+        self.spectrum_values = []
+        self._plot_dirty = True
+        self.line_live.set_data([], [])
+        self.text_overlay.set_text("")
+        self.canvas_live.draw_idle()
 
     def _apply_rate(self):
         self.sample_hz = float(self.spnRate.value())
-        self._alloc_buffers()
-        if self.worker:
+        if self.worker and hasattr(self.worker, "set_rate"):
             self.worker.set_rate(self.sample_hz)
 
     def _apply_window(self):
         self.window_s = float(self.spnWin.value())
-        self._alloc_buffers()
-        self.ax_live.set_xlim(-self.window_s, 0.0)
         self.canvas_live.draw_idle()
 
     def _apply_channel(self):
@@ -290,7 +390,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cmbMode.currentText() == "DIFF" and ch > 3:
             ch = 3
             self.spnChan.setValue(3)
-        if self.worker:
+        if self.worker and hasattr(self.worker, "set_channel"):
             self.worker.set_channel(ch)
 
     def _apply_mode_range(self):
@@ -304,8 +404,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     AnalogInputRange.BIP_2V: (-2,2), AnalogInputRange.BIP_1V: (-1,1)}
         self.ax_live.set_ylim(*ylim_map[rng])
         self.canvas_live.draw_idle()
-        self.worker.reconfigure(mode, rng)
-        self._apply_channel()
+        if self.worker and hasattr(self.worker, "reconfigure"):
+            self.worker.reconfigure(mode, rng)
+            self._apply_channel()
 
     def find_device(self):
         hats = hat_list(HatIDs.MCC_128)
@@ -330,48 +431,43 @@ class MainWindow(QtWidgets.QMainWindow):
         if mode == AnalogInputMode.DIFF and ch > 3:
             ch = 3
             self.spnChan.setValue(3)
+        start_abs = int(self.spnStartAbs.value())
+        step = int(self.spnStep.value())
+        steps = int(self.spnSteps.value())
+        settle = float(self.spnSettle.value())
+        samples_per_step = int(self.spnSamples.value())
+        motor_rpm = float(self.spnMotorRPM.value())
 
-        self._alloc_buffers()
+        if steps <= 0 or step == 0:
+            self.lblStatus.setText("Status: invalid step configuration")
+            return
 
-        self.thread = QtCore.QThread(self)
-        self.worker = ADCWorker(self.address, ch, mode, rng, self.sample_hz)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.start)
-        self.worker.sampleReady.connect(self.on_sample)
-        self.worker.error.connect(self.on_error)
-        self.worker.stopped.connect(self.on_stopped)
-        self.thread.start()
+        positions = [start_abs + i * step for i in range(steps)]
 
+        self._reset_spectrum()
+
+        self.worker = StepScanWorker(self.address, ch, mode, rng, positions,
+                                     settle_s=settle,
+                                     samples_per_step=samples_per_step,
+                                     motor_rpm=motor_rpm)
+        self.worker.start()
+
+        self.queue_timer.start()
         self.btnStart.setEnabled(False)
         self.btnStop.setEnabled(True)
-        self.lblStatus.setText(f"Status: running (ch{ch}, {self.sample_hz:.0f} Hz)")
-        self.timer_plot.start(); self.timer_fft.start()
+        self.lblStatus.setText(f"Status: scanning {steps} steps from {start_abs}")
 
     def stop_acq(self):
-        self.timer_plot.stop(); self.timer_fft.stop()
         if self.worker:
             self.worker.stop()
-        if self.thread:
-            self.thread.quit(); self.thread.wait(1000)
+            self._flush_worker_queue()
+            if self.worker:
+                self.worker = None
+        self.queue_timer.stop()
         self.btnStart.setEnabled(True)
         self.btnStop.setEnabled(False)
-        self.lblStatus.setText("Status: stopped")
-
-    @QtCore.pyqtSlot()
-    def on_stopped(self):
-        self.btnStart.setEnabled(True)
-        self.btnStop.setEnabled(False)
-        self.lblStatus.setText("Status: stopped")
-
-    @QtCore.pyqtSlot(str)
-    def on_error(self, msg: str):
-        self.lblStatus.setText(f"Error: {msg}")
-
-    @QtCore.pyqtSlot(float, float)
-    def on_sample(self, t_rel: float, v: float):
-        # Always record samples; pause only affects display
-        self.tbuf.append(t_rel)
-        self.vbuf.append(v)
+        if not self.lblStatus.text().startswith("Error"):
+            self.lblStatus.setText("Status: stopped")
 
     # ---------- Actions ----------
     def _toggle_pause(self, checked: bool):
@@ -379,74 +475,151 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnPause.setText("Resume Display" if checked else "Pause Display")
 
     def _save_csv(self):
-        if len(self.tbuf) < 2:
+        if len(self.spectrum_positions) == 0:
             return
-        t = np.asarray(self.tbuf, dtype=float)
-        v = np.asarray(self.vbuf, dtype=float)
-        t = t - t[0]
+        pos = np.asarray(self.spectrum_positions, dtype=float)
+        val = np.asarray(self.spectrum_values, dtype=float)
         fn, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save CSV", "capture.csv", "CSV Files (*.csv)")
         if fn:
             try:
-                arr = np.column_stack([t, v])
-                np.savetxt(fn, arr, delimiter=",", header="time_s,voltage_V", comments="")
+                arr = np.column_stack([pos, val])
+                np.savetxt(fn, arr, delimiter=",", header="position_pulses,voltage_V", comments="")
                 self.lblStatus.setText(f"Saved: {Path(fn).name}")
             except Exception as e:
                 self.lblStatus.setText(f"Save failed: {e}")
 
     # ---------- Plot updates ----------
     def _update_plot(self):
-        if self.display_paused or not self.tbuf:
+        if self.display_paused or not self._plot_dirty:
             return
-        t = np.asarray(self.tbuf, dtype=float)
-        v = np.asarray(self.vbuf, dtype=float)
-        if t.size < 2:
+        if not self.spectrum_positions:
+            self._plot_dirty = False
             return
-        t = t - t[-1]  # slide window to end at 0
-        self.line_live.set_data(t, v)
-        if self.chkAutorng.isChecked():
-            vmin = float(np.nanmin(v)); vmax = float(np.nanmax(v))
+
+        pos = np.asarray(self.spectrum_positions, dtype=float)
+        val = np.asarray(self.spectrum_values, dtype=float)
+        if pos.size == 0:
+            self._plot_dirty = False
+            return
+
+        self.line_live.set_data(pos, val)
+
+        xmin = float(np.nanmin(pos)) if pos.size else 0.0
+        xmax = float(np.nanmax(pos)) if pos.size else 1.0
+        if not np.isfinite(xmin) or not np.isfinite(xmax):
+            xmin, xmax = 0.0, 1.0
+        span = xmax - xmin
+        if span <= 0:
+            xmin -= 0.5
+            xmax += 0.5
+        else:
+            pad = 0.05 * span
+            xmin -= pad
+            xmax += pad
+        self.ax_live.set_xlim(xmin, xmax)
+
+        if self.chkAutorng.isChecked() and val.size:
+            vmin = float(np.nanmin(val))
+            vmax = float(np.nanmax(val))
             if np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
-                pad = 0.05*(vmax - vmin + 1e-9)
+                pad = 0.05 * (vmax - vmin + 1e-9)
                 self.ax_live.set_ylim(vmin - pad, vmax + pad)
-        # overlay stats
-        rms = float(np.sqrt(np.nanmean(v**2)))
-        p2p = float(np.nanmax(v) - np.nanmin(v)) if v.size else 0.0
-        self.text_overlay.set_text(f"RMS: {rms:.3f} V\nP-P: {p2p:.3f} V")
-        self.ax_live.set_xlim(-self.window_s, 0.0)
+
+        if val.size:
+            rms = float(np.sqrt(np.nanmean(val**2)))
+            self.text_overlay.set_text(
+                f"Points: {val.size}\nLast: {val[-1]:.3f} V\nRMS: {rms:.3f} V"
+            )
+        else:
+            self.text_overlay.set_text("Points: 0")
+
         self.canvas_live.draw_idle()
+        self._plot_dirty = False
 
     def _update_fft(self):
-        if not self.tbuf:
+        if not self.spectrum_values:
             return
-        t = np.asarray(self.tbuf, dtype=float)
-        v = np.asarray(self.vbuf, dtype=float)
-        if t.size < 8:
+        val = np.asarray(self.spectrum_values, dtype=float)
+        if val.size < 4:
             return
-        # convert to uniform grid (best-effort) in case of slight jitter
-        dt_est = max(1e-9, np.median(np.diff(t)))
-        N = int(min(len(v), self.window_s * self.sample_hz))
-        # use last N samples
-        tseg = t[-N:]
-        vseg = v[-N:]
-        # resample to uniform grid with linear interp (optional)
-        tu = np.linspace(tseg[0], tseg[-1], N)
-        vu = np.interp(tu, tseg, vseg)
-        # window + rFFT
-        win = np.hanning(N)
-        vu_w = vu * win
-        V = np.fft.rfft(vu_w)
-        # amplitude scaling to RMS-like units (approx):
-        # For visualization: magnitude divided by sqrt(2*N) to be modestly scale-stable
-        mag = np.abs(V) / np.sqrt(2*N)
-        freqs = np.fft.rfftfreq(N, d=dt_est)
+        v = val - np.nanmean(val)
+        win = np.hanning(v.size)
+        V = np.fft.rfft(v * win)
+        mag = np.abs(V)
+        freqs = np.fft.rfftfreq(v.size, d=1.0)
         self.line_fft.set_data(freqs, mag)
-        # set limits nicely
-        self.ax_fft.set_xlim(0, freqs.max())
-        # autoscale y each update
+        if freqs.size:
+            self.ax_fft.set_xlim(0, freqs.max())
         if np.all(np.isfinite(mag)) and mag.size:
             ymax = float(np.nanmax(mag))
-            self.ax_fft.set_ylim(0, ymax*1.1 if ymax>0 else 1)
+            self.ax_fft.set_ylim(0, ymax * 1.1 if ymax > 0 else 1.0)
         self.canvas_fft.draw_idle()
+
+    def _poll_worker_queue(self):
+        worker = self.worker
+        if worker is None:
+            self.queue_timer.stop()
+            return
+
+        try:
+            while True:
+                item = worker.queue.get_nowait()
+                self._handle_worker_message(item, worker)
+        except queue.Empty:
+            pass
+
+        if self._plot_dirty:
+            self._update_plot()
+
+    def _flush_worker_queue(self):
+        worker = self.worker
+        if worker is None:
+            return
+        try:
+            while True:
+                item = worker.queue.get_nowait()
+                self._handle_worker_message(item, worker)
+        except queue.Empty:
+            pass
+
+        if self._plot_dirty:
+            self._update_plot()
+
+    def _handle_worker_message(self, item, worker_ref):
+        kind = item[0]
+        if kind == "data":
+            _, pos, val = item
+            self.spectrum_positions.append(pos)
+            self.spectrum_values.append(val)
+            self._plot_dirty = True
+            if len(self.spectrum_values) >= 4:
+                self._update_fft()
+        elif kind == "error":
+            msg = item[1] if len(item) > 1 else "unknown"
+            self.lblStatus.setText(f"Error: {msg}")
+            self._complete_scan(worker_ref)
+        elif kind == "finished":
+            self._complete_scan(worker_ref)
+        elif kind == "status":
+            msg = item[1] if len(item) > 1 else ""
+            if msg:
+                self.lblStatus.setText(f"Status: {msg}")
+
+    def _complete_scan(self, worker_ref):
+        if worker_ref is not None:
+            try:
+                worker_ref.stop()
+            except Exception:
+                pass
+        if self.worker is worker_ref:
+            self.worker = None
+        self.queue_timer.stop()
+        if not self.lblStatus.text().startswith("Error"):
+            self.lblStatus.setText("Status: scan complete")
+        self.btnStart.setEnabled(True)
+        self.btnStop.setEnabled(False)
+        if self._plot_dirty:
+            self._update_plot()
 
     def closeEvent(self, event):
         try:
